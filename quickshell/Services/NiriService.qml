@@ -1296,7 +1296,7 @@ Singleton {
         return outputName;
     }
 
-    function generateOutputsConfig(outputsData) {
+    function generateOutputsConfig(outputsData, callback) {
         const data = outputsData || outputs;
         if (!data || Object.keys(data).length === 0)
             return;
@@ -1371,9 +1371,13 @@ Singleton {
         Proc.runCommand("niri-write-outputs", ["sh", "-c", `mkdir -p "${niriDmsDir}" && cat > "${outputsPath}" << 'EOF'\n${kdlContent}EOF`], (output, exitCode) => {
             if (exitCode !== 0) {
                 console.warn("NiriService: Failed to write outputs config:", output);
+                if (callback)
+                    callback(false);
                 return;
             }
             console.info("NiriService: Generated outputs config at", outputsPath);
+            if (callback)
+                callback(true);
         });
     }
 

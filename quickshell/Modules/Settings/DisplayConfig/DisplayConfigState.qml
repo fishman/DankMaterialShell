@@ -164,22 +164,19 @@ Singleton {
         return CompositorService.compositor === "niri" ? ".kdl" : ".conf";
     }
 
-    function createProfile(name) {
+    function findProfileByName(name) {
         const compositor = CompositorService.compositor;
-        const profileId = "profile_" + Date.now() + "_" + Math.random().toString(36).substr(2, 6);
-        const outputSet = buildCurrentOutputSet();
-        const now = Date.now();
+        const profiles = SettingsData.getDisplayProfiles(compositor);
+        for (const id in profiles) {
+            if (profiles[id].name === name)
+                return id;
+        }
+        return "";
+    }
 
-        const profileData = {
-            "id": profileId,
-            "name": name,
-            "outputSet": outputSet,
-            "createdAt": now,
-            "updatedAt": now
-        };
-
-        const profilesDir = getProfilesDir();
-        const profileFile = profilesDir + "/" + profileId + getProfileExtension();
+    function _writeProfileFile(profileData, profileFile, activate) {
+        const compositor = CompositorService.compositor;
+        const profDir = getProfilesDir();
         const paths = getConfigPaths();
         if (!paths) {
             profileError(I18n.tr("Compositor not supported"));
@@ -187,31 +184,77 @@ Singleton {
         }
 
         profilesLoading = true;
-        Proc.runCommand("create-profile-dir", ["mkdir", "-p", profilesDir], (output, exitCode) => {
+        Proc.runCommand("prof-mkdir", ["mkdir", "-p", profDir], (output, exitCode) => {
             if (exitCode !== 0) {
                 profilesLoading = false;
                 profileError(I18n.tr("Failed to create profiles directory"));
                 return;
             }
-            Proc.runCommand("copy-profile", ["cp", "-L", paths.outputsFile, profileFile], (output2, exitCode2) => {
+            Proc.runCommand("prof-copy", ["sh", "-c", `[ "${paths.outputsFile}" -ef "${profileFile}" ] || cp -L "${paths.outputsFile}" "${profileFile}"`], (output2, exitCode2) => {
                 if (exitCode2 !== 0) {
                     profilesLoading = false;
                     profileError(I18n.tr("Failed to save profile file"));
                     return;
                 }
-                SettingsData.setDisplayProfile(compositor, profileId, profileData);
-                SettingsData.setActiveDisplayProfile(compositor, profileId);
+                SettingsData.setDisplayProfile(compositor, profileData.id, profileData);
+                if (activate)
+                    SettingsData.setActiveDisplayProfile(compositor, profileData.id);
                 const updated = JSON.parse(JSON.stringify(validatedProfiles));
-                updated[profileId] = profileData;
+                updated[profileData.id] = profileData;
                 validatedProfiles = updated;
-                Proc.runCommand("link-new-profile", ["ln", "-sf", profileFile, paths.outputsFile], () => {
+                Proc.runCommand("prof-link", ["ln", "-sf", profileFile, paths.outputsFile], () => {
                     profilesLoading = false;
-                    currentOutputSet = outputSet;
-                    matchedProfile = profileId;
-                    profileSaved(profileId, name);
+                    currentOutputSet = profileData.outputSet;
+                    matchedProfile = profileData.id;
+                    profileSaved(profileData.id, profileData.name);
                 });
             });
         });
+    }
+
+    function overwriteProfile(existingId, name) {
+        const outputSet = buildCurrentOutputSet();
+        const now = Date.now();
+        const profileData = {
+            "id": existingId,
+            "name": name,
+            "outputSet": outputSet,
+            "createdAt": now,
+            "updatedAt": now
+        };
+        const profileFile = getProfilesDir() + "/" + existingId + getProfileExtension();
+        _writeProfileFile(profileData, profileFile, false);
+    }
+
+    function _hashOutputSet(outputSet) {
+        const sorted = [...outputSet].sort().join("|");
+        let hash = 0;
+        for (let i = 0; i < sorted.length; i++) {
+            hash = ((hash << 5) - hash) + sorted.charCodeAt(i);
+            hash |= 0;
+        }
+        return (hash >>> 0).toString(16);
+    }
+
+    function createProfile(name) {
+        const existingId = findProfileByName(name);
+        if (existingId) {
+            overwriteProfile(existingId, name);
+            return;
+        }
+        const outputSet = buildCurrentOutputSet();
+        const safeName = name.replace(/[^a-zA-Z0-9_-]/g, "_");
+        const profileId = "profile_" + safeName + "_" + _hashOutputSet(outputSet);
+        const now = Date.now();
+        const profileData = {
+            "id": profileId,
+            "name": name,
+            "outputSet": outputSet,
+            "createdAt": now,
+            "updatedAt": now
+        };
+        const profileFile = getProfilesDir() + "/" + profileId + getProfileExtension();
+        _writeProfileFile(profileData, profileFile, true);
     }
 
     function renameProfile(profileId, newName) {
@@ -898,17 +941,24 @@ Singleton {
         WlrOutputService.requestState();
     }
 
-    function backendWriteOutputsConfig(outputsData) {
+    function backendWriteOutputsConfig(outputsData, callback) {
+        const done = (success) => {
+            if (callback)
+                callback(success);
+        };
         switch (CompositorService.compositor) {
         case "niri":
-            NiriService.generateOutputsConfig(outputsData);
+            NiriService.generateOutputsConfig(outputsData, done);
             break;
         case "hyprland":
-            HyprlandService.generateOutputsConfig(outputsData, buildMergedHyprlandSettings());
+            HyprlandService.generateOutputsConfig(outputsData, buildMergedHyprlandSettings(), done);
             break;
         case "dwl":
-            DwlService.generateOutputsConfig(outputsData);
+            DwlService.generateOutputsConfig(outputsData, done);
             break;
+        default:
+            if (callback)
+                callback(false);
         }
     }
 
@@ -1271,7 +1321,18 @@ Singleton {
             commitHyprlandSettingsChanges();
 
         const mergedOutputs = buildOutputsWithPendingChanges();
-        backendWriteOutputsConfig(mergedOutputs);
+        backendWriteOutputsConfig(mergedOutputs, success => {
+            if (success)
+                _autoUpdateMatchedProfile();
+        });
+    }
+
+    function _autoUpdateMatchedProfile() {
+        if (!matchedProfile)
+            return;
+        const profile = validatedProfiles[matchedProfile];
+        if (profile && profile.name)
+            overwriteProfile(matchedProfile, profile.name);
     }
 
     function validateAndApplyNiriConfig(changeDescriptions) {
@@ -1304,7 +1365,10 @@ Singleton {
                 if (formatChanged)
                     SettingsData.saveSettings();
                 commitNiriSettingsChanges();
-                backendWriteOutputsConfig(mergedOutputs);
+                backendWriteOutputsConfig(mergedOutputs, success => {
+                    if (success)
+                        _autoUpdateMatchedProfile();
+                });
             });
         });
     }
